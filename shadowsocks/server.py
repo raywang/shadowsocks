@@ -1,46 +1,41 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+#
+# Copyright 2015 clowwindy
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
 
-# Copyright (c) 2014 clowwindy
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+from __future__ import absolute_import, division, print_function, \
+    with_statement
 
 import sys
 import os
 import logging
-import utils
-import encrypt
-import eventloop
-import tcprelay
-import udprelay
-import asyncdns
+import signal
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../'))
+from shadowsocks import shell, daemon, eventloop, tcprelay, udprelay, asyncdns
 
 
 def main():
-    utils.check_python()
+    shell.check_python()
 
-    config = utils.get_config(False)
+    config = shell.get_config(False)
 
-    utils.print_shadowsocks()
+    daemon.daemon_exec(config)
 
     if config['port_password']:
-        if config['server_port'] or config['password']:
+        if config['password']:
             logging.warn('warning: port_password should not be used with '
                          'server_port and password. server_port and password '
                          'will be ignored')
@@ -53,7 +48,6 @@ def main():
         else:
             config['port_password'][str(server_port)] = config['password']
 
-    encrypt.init_table(config['password'], config['method'])
     tcp_servers = []
     udp_servers = []
     dns_resolver = asyncdns.DNSResolver()
@@ -67,25 +61,33 @@ def main():
         udp_servers.append(udprelay.UDPRelay(a_config, dns_resolver, False))
 
     def run_server():
+        def child_handler(signum, _):
+            logging.warn('received SIGQUIT, doing graceful shutting down..')
+            list(map(lambda s: s.close(next_tick=True),
+                     tcp_servers + udp_servers))
+        signal.signal(getattr(signal, 'SIGQUIT', signal.SIGTERM),
+                      child_handler)
+
+        def int_handler(signum, _):
+            sys.exit(1)
+        signal.signal(signal.SIGINT, int_handler)
+
         try:
             loop = eventloop.EventLoop()
             dns_resolver.add_to_loop(loop)
-            for tcp_server in tcp_servers:
-                tcp_server.add_to_loop(loop)
-            for udp_server in udp_servers:
-                udp_server.add_to_loop(loop)
+            list(map(lambda s: s.add_to_loop(loop), tcp_servers + udp_servers))
+
+            daemon.set_user(config.get('user', None))
             loop.run()
-        except (KeyboardInterrupt, IOError, OSError) as e:
-            logging.error(e)
-            import traceback
-            traceback.print_exc()
-            os._exit(0)
+        except Exception as e:
+            shell.print_exception(e)
+            sys.exit(1)
 
     if int(config['workers']) > 1:
         if os.name == 'posix':
             children = []
             is_child = False
-            for i in xrange(0, int(config['workers'])):
+            for i in range(0, int(config['workers'])):
                 r = os.fork()
                 if r == 0:
                     logging.info('worker started')
@@ -97,11 +99,15 @@ def main():
             if not is_child:
                 def handler(signum, _):
                     for pid in children:
-                        os.kill(pid, signum)
-                        os.waitpid(pid, 0)
+                        try:
+                            os.kill(pid, signum)
+                            os.waitpid(pid, 0)
+                        except OSError:  # child may already exited
+                            pass
                     sys.exit()
-                import signal
                 signal.signal(signal.SIGTERM, handler)
+                signal.signal(signal.SIGQUIT, handler)
+                signal.signal(signal.SIGINT, handler)
 
                 # master
                 for a_tcp_server in tcp_servers:
